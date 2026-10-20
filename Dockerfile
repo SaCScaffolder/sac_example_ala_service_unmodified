@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1.6
+#
+# Multi-stage build for ala-service-unmodified-20261020-032410-3f9b.
+#   build  — golang:1.22 + CGO enabled (so we can vet with the race detector in CI)
+#   runtime — distroless static; nonroot; minimal attack surface
+#
+# This template is part of servicectl's go-webapi scaffold.
+# Edit as needed — every line is meant to be readable.
+
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+
+# Cache go.mod/go.sum first so dependency downloads don't bust on every code change.
+COPY go.mod go.sum* ./
+# Copy the source BEFORE `go mod tidy` so the blank import of
+# the pgx stdlib driver in cmd/server/main.go is visible to
+# `go mod tidy`. Without this, `go mod tidy` runs before the
+# source is in place, doesn't see the `_ "pgx/v5/stdlib"`
+# import, and leaves the stdlib subpackage out of go.mod. The
+# subsequent `go build` then fails with "no required module
+# provides package github.com/jackc/pgx/v5/stdlib".
+# (Surfaced on the first end-to-end run of the postgres
+# scaffold, 2026-10-18.)
+COPY cmd ./cmd
+COPY internal ./internal
+# `go mod download` (the previous command) only writes the
+# `/go.mod h1:...` entries to go.sum. For a freshly-scaffolded
+# go.mod with no go.sum, it doesn't add the indirect entries to
+# go.mod for transitive deps, and the subsequent `go build` step
+# then complains about missing go.sum entries. `go mod tidy` is
+# the right command: it adds the `// indirect` lines, populates
+# go.sum with both kinds of hashes, and the build proceeds.
+# Same fix as the ci.yml workflow (2026-10-18).
+RUN go mod tidy
+
+# Now we have all the source + go.sum. Build the binary.
+
+# -trimpath  → reproducible builds (no absolute paths in the binary)
+# -ldflags   → strip debug info + set a build-time version
+# CGO_ENABLED=0 → static binary; runs on distroless with no libc dependency.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build \
+        -trimpath \
+        -ldflags="-s -w -X main.version=${VERSION}" \
+        -o /out/ala-service-unmodified-20261020-032410-3f9b \
+        ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+WORKDIR /app
+
+# OCI image metadata. `org.opencontainers.image.source` is the
+# critical one: GitHub Packages uses it to auto-link a freshly-pushed
+# package to this repo on first push, so the workflow's GITHUB_TOKEN
+# (which has Packages: write scoped to *this repo's* namespace) can
+# push without the `permission_denied: write_package` rejection. Without
+# these labels the first push creates the package in the user/org
+# namespace and subsequent pushes from a different (rescaffolded) repo
+# fail. See PR #103.
+#
+# Pass the source URL at build time via --build-arg IMAGE_SOURCE=...
+# in ci.yml (the workflow substitutes the GitHub Actions expression
+# github.repository at run time).
+ARG IMAGE_SOURCE
+ARG IMAGE_URL
+LABEL org.opencontainers.image.source=${IMAGE_SOURCE} \
+      org.opencontainers.image.url=${IMAGE_URL} \
+      org.opencontainers.image.title="ala-service-unmodified-20261020-032410-3f9b" \
+      org.opencontainers.image.description="Service scaffolded by servicectl from simple_and_clean"
+
+COPY --from=build /out/ala-service-unmodified-20261020-032410-3f9b /app/ala-service-unmodified-20261020-032410-3f9b
+
+USER nonroot:nonroot
+EXPOSE 3000
+ENV PORT=3000
+
+ENTRYPOINT ["/app/ala-service-unmodified-20261020-032410-3f9b"]

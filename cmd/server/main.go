@@ -1,0 +1,184 @@
+// Package main is the entrypoint for ala-service-unmodified-20261020-032410-3f9b.
+//
+// This file is part of the servicectl go-webapi scaffold. It's intentionally
+// small - the real HTTP handlers live in internal/ala_service_unmodified_20261020_032410_3f9b/.
+//
+// What this scaffold gives you out of the box:
+//
+//   - Three (or four, with --db=postgres) endpoints:
+//       /healthz  - always 200 if the process is up (livenessProbe target)
+//       /readyz   - 200 if the DB (if configured) responds to PingContext
+//       /         - index, returns {"service": ..., "status": "running"}
+//       /notes    - POST/GET, only when --db=postgres (PR 5 of the
+//                   GKE+postgres milestone)
+//   - Graceful shutdown on SIGINT/SIGTERM with a 10s drain window.
+//   - A `migrate` subcommand that runs the embedded SQL migrations
+//     against $DATABASE_URL. The deploy workflow invokes this via
+//     `kubectl exec` before bringing the new pods into rotation.
+//   - The server listens on $PORT (default 3000) on all interfaces so it
+//     works in containers without surprises.
+//
+// What's intentionally NOT here (and where to add it):
+//
+//   - Structured logging: drop in slog or zap in internal/ala_service_unmodified_20261020_032410_3f9b/logger.go.
+//   - OpenTelemetry: wrap the http.Server handlers in an otelhttp.NewHandler.
+//   - Auth: middleware in internal/ala_service_unmodified_20261020_032410_3f9b/middleware.go.
+//
+// Edit freely. The scaffold is yours.
+package main
+
+import (
+	"context"
+
+	"database/sql"
+
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver
+
+
+	"github.com/henryorsborn/ala-service-unmodified-20261020-032410-3f9b/internal/ala_service_unmodified_20261020_032410_3f9b"
+)
+
+func main() {
+	// `migrate` is a subcommand: <service_name> migrate runs the embedded
+	// SQL migrations against $DATABASE_URL and exits. The deploy workflow
+	// invokes this via `kubectl exec` before bringing new pods into
+	// rotation. We check for it first so a subcommand can't be confused
+	// with a missing arg.
+	if len(os.Args) >= 2 && os.Args[1] == "migrate" {
+		if err := runMigrate(); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+		log.Printf("migrate: ok")
+		return
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	if err := runServer(buildServer(), sigCh); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+// runMigrate opens a *sql.DB against $DATABASE_URL, pings to confirm
+// connectivity, then runs the embedded migrations. Returns nil on
+// success; returns the error from any stage on failure.
+//
+// The connection is closed on return. The deploy workflow is
+// expected to call this from a one-shot `kubectl exec` so we don't
+// need to worry about graceful shutdown here.
+//
+// For non-postgres renders, this is a no-op stub (the `migrate`
+// subcommand is not wired into the deploy workflow when
+// --db != postgres, but we keep the function so the binary's
+// CLI surface is consistent across db flavors).
+func runMigrate() error {
+
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return errors.New("DATABASE_URL is not set")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return errors.New("sql.Open: " + err.Error())
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return errors.New("ping: " + err.Error())
+	}
+	return ala_service_unmodified_20261020_032410_3f9b.RunMigrations(ctx, db)
+
+}
+
+// buildServer wires the http.Server together from $PORT, the optional
+// $DATABASE_URL, and NewServer. Extracted from main() so the wiring
+// is exercisable from a test, which gives cmd/server/main.go real
+// coverage.
+//
+// If $DATABASE_URL is set (only meaningful for the postgres
+// render; the non-postgres render has no DB code), we open a
+// *sql.DB and pass it into the Server. The connection pool is
+// configured for the typical k8s pod: 25 max open, 5 idle, and a
+// 5-minute connection lifetime so rotated passwords take effect
+// without restarting the pod.
+func buildServer() *http.Server {
+
+	var db *sql.DB
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		var err error
+		db, err = sql.Open("pgx", dsn)
+		if err != nil {
+			log.Printf("warning: sql.Open failed; running without DB: %v", err)
+			db = nil
+		} else {
+			db.SetMaxOpenConns(25)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+		}
+	}
+
+	return &http.Server{
+		Addr:              listenAddr(),
+		Handler:           ala_service_unmodified_20261020_032410_3f9b.NewServer(db).Mux(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+// listenAddr returns ":$PORT" with PORT defaulting to "3000".
+func listenAddr() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+	return ":" + port
+}
+
+// runServer starts srv in a goroutine and blocks until either srv
+// errors fatally or sigCh receives a signal. On signal, gracefully
+// drains in-flight requests with a 10-second timeout.
+//
+// Extracted from main() so the lifecycle logic is exercisable in tests.
+// Production callers invoke this from main(); tests invoke it directly.
+// Returns nil on graceful shutdown, or the listener error if ListenAndServe
+// returned a non-ErrServerClosed error.
+func runServer(srv *http.Server, sigCh <-chan os.Signal) error {
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("ala-service-unmodified-20261020-032410-3f9b listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("received signal %s; shutting down", sig)
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
+		return err
+	}
+	log.Printf("shutdown complete")
+	return nil
+}

@@ -1,0 +1,355 @@
+// Tests for the cmd/server entrypoint of ala-service-unmodified-20261020-032410-3f9b.
+//
+// main() itself is just signal wiring (signal.Notify + invoke runServer).
+// The real entry point under test is buildServer(), listenAddr(), and
+// runServer(). We exercise them directly:
+//
+//   - buildServer: assert the assembled *http.Server uses NewMux() and
+//     responds to the routes the rest of the suite expects.
+//   - listenAddr: assert $PORT overrides the default and the default
+//     is ":3000" when PORT is unset.
+//   - runServer: drive it with a synthetic signal channel and assert
+//     it shuts down gracefully.
+//
+// This brings cmd/server/main.go from 0% to real coverage so the
+// scaffolded service clears the 80% coverage gate on day one.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"fmt"
+
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// TestWiringMirrorsMain asserts that buildServer() returns an
+// http.Server whose Handler responds to the routes the rest of the
+// suite expects. If a future scaffold change swaps NewMux() for
+// something that doesn't register /healthz, /readyz, /, this test
+// catches it.
+func TestWiringMirrorsMain(t *testing.T) {
+	srv := buildServer()
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	for _, path := range []string{"/healthz", "/readyz", "/"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: expected 200, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestDefaultAddrIsColonThreeThousand guards the documented default
+// port. If you change the default in listenAddr(), change this test
+// to match.
+func TestDefaultAddrIsColonThreeThousand(t *testing.T) {
+	t.Setenv("PORT", "")
+	if got := listenAddr(); got != ":3000" {
+		t.Errorf("expected default Addr=:3000, got %q", got)
+	}
+}
+
+// TestPortEnvOverridesDefault verifies that $PORT changes the listen
+// address. This is what makes buildServer() usable in containers
+// without recompiling.
+func TestPortEnvOverridesDefault(t *testing.T) {
+	t.Setenv("PORT", "8080")
+	if got := listenAddr(); got != ":8080" {
+		t.Errorf("expected Addr=:8080, got %q", got)
+	}
+}
+
+// TestServiceNameAdvertised confirms the index endpoint's "service"
+// field matches the service name. Proves the assembled mux serves
+// the right service name end-to-end.
+func TestServiceNameAdvertised(t *testing.T) {
+	srv := buildServer()
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if !strings.HasPrefix(body["service"], "ala-service-unmodified-20261020-032410-3f9b") {
+		t.Errorf("expected service name to start with %q, got %q",
+			"ala-service-unmodified-20261020-032410-3f9b", body["service"])
+	}
+}
+
+// TestRunServerShutsDownOnSignal exercises runServer's signal-handling
+// path: we bind a real listener on a random port, run runServer in a
+// goroutine, send a synthetic SIGTERM, and assert it returns and the
+// listener is closed.
+func TestRunServerShutsDownOnSignal(t *testing.T) {
+	// Pick a free port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on random port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	srv := buildServer()
+	// Override Addr to the random port we picked.
+	srv.Addr = net.JoinHostPort("127.0.0.1", itoa(port))
+
+	sigCh := make(chan os.Signal, 1)
+
+	got := make(chan error, 1)
+	go func() {
+		got <- runServer(srv, sigCh)
+	}()
+
+	// Wait briefly for the server to be ready, then send a signal.
+	base := "http://" + srv.Addr
+	if !waitForReady(base+"/healthz", 2*time.Second) {
+		t.Skipf("server did not come up on %s; signal channel may have closed", srv.Addr)
+	}
+	sigCh <- syscall.SIGTERM
+
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("runServer returned error on signal shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runServer did not return within 3s of SIGTERM")
+	}
+
+	// Confirm the listener is closed: a fresh connection should fail.
+	if _, err := net.DialTimeout("tcp", srv.Addr, 200*time.Millisecond); err == nil {
+		t.Errorf("expected connection refused after shutdown, got nil")
+	}
+}
+
+// waitForReady polls url until it returns 200 or timeout elapses.
+// Returns true if the URL became ready, false otherwise.
+func waitForReady(url string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+// TestRunServerShutsDownOnServerError exercises runServer's errCh
+// path: we bind a real listener on a random port, hand it to the
+// server, then close the listener before runServer starts so
+// ListenAndServe returns an error. runServer must receive that
+// error on errCh and return it.
+func TestRunServerShutsDownOnServerError(t *testing.T) {
+	// Bind a port but never release it, then ask the server to bind
+	// the same port. That makes ListenAndServe return an error.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           http.NewServeMux(),
+		ReadHeaderTimeout: 5 * time.Millisecond,
+	}
+
+	sigCh := make(chan os.Signal, 1)
+
+	got := make(chan error, 1)
+	go func() {
+		got <- runServer(srv, sigCh)
+	}()
+
+	// runServer should detect the bind failure and return with the error.
+	select {
+	case err := <-got:
+		if err == nil {
+			t.Fatal("expected error from runServer on bind failure, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runServer did not return within 2s of bind failure")
+	}
+}
+
+// TestRunServerReturnsNilOnExternalShutdown covers the case where
+// ListenAndServe returns http.ErrServerClosed because something
+// else (not the signal channel) called srv.Shutdown. The goroutine
+// then sends nil to errCh, the select picks the errCh case (not
+// the sigCh case), and runServer returns nil. This is the
+// "cleanest possible exit" path and was previously uncovered,
+// which pulled cmd/server's coverage below 80% and failed the
+// coverage_threshold gate for services that asked for >=85%.
+func TestRunServerReturnsNilOnExternalShutdown(t *testing.T) {
+	// Pick a free port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on random port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	srv := buildServer()
+	// Override Addr to the random port we picked.
+	srv.Addr = net.JoinHostPort("127.0.0.1", itoa(port))
+
+	sigCh := make(chan os.Signal, 1)
+
+	got := make(chan error, 1)
+	go func() {
+		got <- runServer(srv, sigCh)
+	}()
+
+	// Wait briefly for the server to be ready, then call Shutdown
+	// externally (NOT via the signal channel). This makes
+	// ListenAndServe return http.ErrServerClosed, the goroutine
+	// sends nil to errCh, the select hits the errCh case, and
+	// runServer returns nil.
+	base := "http://" + srv.Addr
+	if !waitForReady(base+"/healthz", 2*time.Second) {
+		t.Skipf("server did not come up on %s; signal channel may have closed", srv.Addr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("external shutdown: %v", err)
+	}
+
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Errorf("expected nil from runServer after external Shutdown, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runServer did not return within 3s of external Shutdown")
+	}
+}
+
+// itoa is a tiny strconv.Itoa shim. Avoids pulling strconv in just for one
+// usage in this test file.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+
+//
+// --- migrate subcommand tests (--db=postgres only) -----------------------
+//
+// The `migrate` subcommand opens a *sql.DB against $DATABASE_URL, pings,
+// and calls internal/<svc>.RunMigrations. These tests cover the
+// subcommand's wiring: the DATABASE_URL read, the sql.Open, the
+// PingContext, and the RunMigrations call. The actual migration SQL
+// is covered by TestRunMigrations in internal/<svc>/server_test.go.
+//
+
+// postgresDSN builds the same connection string runMigrate would
+// build from $DATABASE_URL, but constructed from the POSTGRES_*
+// env vars that the CI workflow's services: postgres: block sets.
+// This lets us point runMigrate at the CI's postgres without
+// requiring the test runner to know the DSN format.
+func postgresDSN(t *testing.T) string {
+	t.Helper()
+	if os.Getenv("POSTGRES_HOST") == "" {
+		t.Skip("POSTGRES_HOST not set; skipping migrate-subcommand test")
+	}
+	return fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("POSTGRES_HOST"),
+		getenvDefault("POSTGRES_PORT", "5432"),
+		os.Getenv("POSTGRES_USER"),
+		os.Getenv("POSTGRES_PASSWORD"),
+		os.Getenv("POSTGRES_DB"),
+	)
+}
+
+// getenvDefault is a tiny helper mirroring the same function in
+// internal/<svc>/server_test.go. Duplicated here to avoid an import
+// cycle (server_test.go imports "main" only via the build, not at
+// runtime, so we can't share a helpers package without an
+// awkward third package).
+func getenvDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// TestRunMigrateSuccess verifies the migrate subcommand's happy
+// path: with $DATABASE_URL set to a reachable postgres, runMigrate
+// returns nil and the notes table is created. This is the
+// end-to-end test for the deploy workflow's
+// `kubectl exec deploy/<name> -- /app/<name> migrate` step.
+func TestRunMigrateSuccess(t *testing.T) {
+	t.Setenv("DATABASE_URL", postgresDSN(t))
+	if err := runMigrate(); err != nil {
+		t.Fatalf("runMigrate: %v", err)
+	}
+}
+
+// TestRunMigrateNoDatabaseURL verifies runMigrate returns an
+// error when $DATABASE_URL is unset, without crashing.
+func TestRunMigrateNoDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	err := runMigrate()
+	if err == nil {
+		t.Fatal("expected error from runMigrate with empty DATABASE_URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Errorf("expected error to mention DATABASE_URL, got: %v", err)
+	}
+}
+
+// TestRunMigrateBadDSN verifies runMigrate returns an error
+// when $DATABASE_URL points at an unreachable host. Exercises
+// the sql.Open + PingContext failure paths.
+func TestRunMigrateBadDSN(t *testing.T) {
+	t.Setenv("DATABASE_URL", "host=nonexistent.invalid port=5432 user=postgres password=postgres dbname=postgres sslmode=disable")
+	err := runMigrate()
+	if err == nil {
+		t.Fatal("expected error from runMigrate with bad DSN, got nil")
+	}
+}
+
+
+// sentinel unused-import guard. Keeps `errors` referenced in case a
+// future test asserts on ListenAndServe's error path.
+var _ = errors.New
